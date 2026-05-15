@@ -76,26 +76,22 @@ async function handle(message, _client) {
     const strippedJid = rawAuthor.replace(/@.*$/, '');
     const sender     = contact.pushname || contact.number || strippedJid || 'Unknown';
 
-    const rawTs       = message.timestamp;
-    const tsMs        = rawTs && rawTs > 0 ? rawTs * 1000 : Date.now();
-    const timestampISO = new Date(tsMs).toISOString();
+    const rawTs = message.timestamp;
+    const tsMs  = rawTs && rawTs > 0 ? rawTs * 1000 : Date.now();
+
+    // chatId is only included when chatName is unavailable or chatType is unknown,
+    // because the folder structure already encodes chat identity for normal messages.
+    const needsChatId = !chatName || chatName === 'Unknown' || chatType === 'unknown';
 
     let metadata = {
-      id:            msgId,
+      id:       msgId,
       chatType,
-      chatId:        fromStr,
+      ...(needsChatId ? { chatId: fromStr } : {}),
       chatName,
       sender,
-      senderNumber:  contact.number || null,
-      timestamp:     rawTs || Math.floor(tsMs / 1000),
-      timestampISO,
-      type:          message.type || 'unknown',
-      body:          message.body || null,
-      hasMedia:      message.hasMedia || false,
-      mediaFilename: null,
-      mediaMimetype: null,
-      mediaSize:     null,
-      filePath:      null,
+      timestamp: rawTs || Math.floor(tsMs / 1000),
+      type:      message.type || 'unknown',
+      body:      message.body || '',
     };
 
     if (message.hasMedia) {
@@ -107,7 +103,7 @@ async function handle(message, _client) {
     health.metrics.incMessage();
     const preview = metadata.body
       ? ` | "${metadata.body.slice(0, 60)}"`
-      : (metadata.mediaFilename ? ` | [${metadata.type}]` : '');
+      : (metadata.media ? ` | [${metadata.type}]` : '');
     logger.info(`[${chatType.toUpperCase()}] ${chatName} | ${sender}${preview}`);
 
   } catch (err) {

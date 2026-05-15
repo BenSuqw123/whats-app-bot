@@ -113,9 +113,8 @@ async function _download(message, metadata, msgId) {
       `> limit ${config.maxMediaSizeMb} MB (msg ${msgId || '?'})`
     );
     health.metrics.incMediaOversized();
-    metadata.mediaSkipped  = true;
-    metadata.mediaMimetype = media.mimetype || null;
-    metadata.mediaSize     = approxBytes;
+    // Record that media existed but was skipped, without storing null fields
+    metadata.media = { mimetype: media.mimetype || undefined, size: approxBytes, skipped: true };
     return metadata;
   }
 
@@ -137,11 +136,13 @@ async function _download(message, metadata, msgId) {
 
   try {
     const { filePath, fileSize } = storageService.saveMedia(media.data, targetDir, filename, uniqueSuffix);
-    metadata.mediaFilename = path.basename(filePath);
-    metadata.mediaMimetype = media.mimetype || null;
-    metadata.mediaSize     = fileSize;
-    metadata.filePath      = filePath;
-    metadata.mediaSkipped  = false;
+    // Nested media object — only present when a file was actually persisted
+    metadata.media = {
+      filename: path.basename(filePath),
+      mimetype: media.mimetype || undefined,
+      size:     fileSize,
+      path:     filePath,
+    };
     health.metrics.incMediaOk();
   } catch (err) {
     logger.error(`[mediaHandler] Failed to write media to disk: ${err.message}`);
