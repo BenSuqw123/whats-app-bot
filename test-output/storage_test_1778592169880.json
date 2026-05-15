@@ -1,0 +1,62 @@
+[
+  {
+    "id": "concurrent-0",
+    "chatType": "dm",
+    "chatName": "Kiểm tra tiếng Việt 🇻🇳",
+    "sender": "Nguyễn Văn A",
+    "body": "Chào buổi sáng! 🌞 This is a test with Vietnamese: Xin chào thế giới",
+    "timestamp": 1778592169,
+    "timestampISO": "2026-05-12T13:22:49.880Z",
+    "hasMedia": false,
+    "mediaFilename": null,
+    "seq": 0
+  },
+  {
+    "id": "concurrent-1",
+    "chatType": "dm",
+    "chatName": "Kiểm tra tiếng Việt 🇻🇳",
+    "sender": "Nguyễn Văn A",
+    "body": "Chào buổi sáng! 🌞 This is a test with Vietnamese: Xin chào thế giới",
+    "timestamp": 1778592169,
+    "timestampISO": "2026-05-12T13:22:49.880Z",
+    "hasMedia": false,
+    "mediaFilename": null,
+    "seq": 1
+  },
+  {
+    "id": "concurrent-2",
+    "chatType": "dm",
+    "chatName": "Kiểm tra tiếng Việt 🇻🇳",
+    "sender": "Nguyễn Văn A",
+    "body": "Chào buổi sáng! 🌞 This is a test with Vietnamese: Xin chào thế giới",
+    "timestamp": 1778592169,
+    "timestampISO": "2026-05-12T13:22:49.880Z",
+    "hasMedia": false,
+    "mediaFilename": null,
+    "seq": 2
+  },
+  {
+    "id": "concurrent-3",
+    "chatType": "dm",
+    "chatName": "Kiểm tra tiếng Việt 🇻🇳",
+    "sender": "Nguyễn Văn A",
+    "body": "Chào buổi sáng! 🌞 This is a test with Vietnamese: Xin chào thế giới",
+    "timestamp": 1778592169,
+    "timestampISO": "2026-05-12T13:22:49.880Z",
+    "hasMedia": false,
+    "mediaFilename": null,
+    "seq": 3
+  },
+  {
+    "id": "concurrent-4",
+    "chatType": "dm",
+    "chatName": "Kiểm tra tiếng Việt 🇻🇳",
+    "sender": "Nguyễn Văn A",
+    "body": "Chào buổi sáng! 🌞 This is a test with Vietnamese: Xin chào thế giới",
+    "timestamp": 1778592169,
+    "timestampISO": "2026-05-12T13:22:49.880Z",
+    "hasMedia": false,
+    "mediaFilename": null,
+    "seq": 4
+  }
+]

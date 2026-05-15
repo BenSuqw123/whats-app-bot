@@ -1,0 +1,148 @@
+{
+  "generatedAt": "2026-05-12T13:22:49.936Z",
+  "totalChats": 4,
+  "chatsByType": {
+    "groups": 0,
+    "dms": 4,
+    "broadcasts": 0
+  },
+  "messageThreads": 2,
+  "mediaDownloads": 0,
+  "errors": [],
+  "dedupProof": {
+    "first": false,
+    "second": true,
+    "third": true,
+    "pass": true
+  },
+  "memory": {
+    "heapUsedMB": "30.96",
+    "rssMB": "87.17",
+    "deltaHeapMB": "8.12"
+  },
+  "chats": [
+    {
+      "name": "Bác Khánh",
+      "id": "265652485013639@lid",
+      "type": "DM",
+      "unread": 0,
+      "lastMsgTs": "2026-05-12 19:35:09"
+    },
+    {
+      "name": "Bác Trứ",
+      "id": "252875309637886@lid",
+      "type": "DM",
+      "unread": 0,
+      "lastMsgTs": "n/a"
+    },
+    {
+      "name": "Điện Thoại Văn Phòng",
+      "id": "152424245366882@lid",
+      "type": "DM",
+      "unread": 0,
+      "lastMsgTs": "2026-05-07 11:24:50"
+    },
+    {
+      "name": "+44 7974 045725",
+      "id": "152969823653952@lid",
+      "type": "DM",
+      "unread": 0,
+      "lastMsgTs": "2026-04-29 12:55:17"
+    }
+  ],
+  "messages": [
+    {
+      "chatName": "Bác Khánh",
+      "chatId": "265652485013639@lid",
+      "chatType": "DM",
+      "msgCount": 20,
+      "dupHits": 20,
+      "messages": [
+        {
+          "id": "true_265652485013639@lid_3A21D07A150A9C0308CF",
+          "type": "chat",
+          "sender": "6125311283300",
+          "timestamp": "2026-05-05 11:24:40",
+          "body": "Dạ bác Khánh",
+          "hasMedia": false,
+          "hasVietnamese": true,
+          "hasEmoji": false,
+          "mediaFile": null
+        },
+        {
+          "id": "false_265652485013639@lid_3EB0ED3440A1703F10DEE1",
+          "type": "chat",
+          "sender": "Khanh Le",
+          "timestamp": "2026-05-05 11:24:52",
+          "body": "con còn một số việc để làm nha",
+          "hasMedia": false,
+          "hasVietnamese": true,
+          "hasEmoji": false,
+          "mediaFile": null
+        },
+        {
+          "id": "true_265652485013639@lid_3A31C2D047274BB4B65B",
+          "type": "chat",
+          "sender": "6125311283300",
+          "timestamp": "2026-05-05 11:25:23",
+          "body": "Dạ bác Khánh",
+          "hasMedia": false,
+          "hasVietnamese": true,
+          "hasEmoji": false,
+          "mediaFile": null
+        },
+        {
+          "id": "false_265652485013639@lid_3EB0AF5FA9E1CAA1BA2005",
+          "type": "chat",
+          "sender": "Khanh Le",
+          "timestamp": "2026-05-06 09:20:36",
+          "body": "Minh đăng , con rảnh con gọi lại giúp bác khánh nha",
+          "hasMedia": false,
+          "hasVietnamese": true,
+          "hasEmoji": false,
+          "mediaFile": null
+        },
+        {
+          "id": "true_265652485013639@lid_3ADE69E4A5DC41D4D426",
+          "type": "chat",
+          "sender": "6125311283300",
+          "timestamp": "2026-05-06 17:02:01",
+          "body": "Dạ bác Khánh ơi trưa mai con làm cho bác Khanh nha",
+          "hasMedia": false,
+          "hasVietnamese": true,
+          "hasEmoji": false,
+          "mediaFile": null
+        }
+      ]
+    },
+    {
+      "chatName": "Bác Trứ",
+      "chatId": "252875309637886@lid",
+      "chatType": "DM",
+      "msgCount": 0,
+      "dupHits": 20,
+      "messages": []
+    }
+  ],
+  "media": [],
+  "storage": [
+    {
+      "filePath": "C:\\Users\\User\\Desktop\\Làm cho bác Khánh\\whats_app_bot\\test-output\\storage_test_1778592169880.json",
+      "recordsWritten": 5,
+      "concurrentWrites": 5,
+      "note": "✅ All records preserved",
+      "sampleRecord": {
+        "id": "concurrent-0",
+        "chatType": "dm",
+        "chatName": "Kiểm tra tiếng Việt 🇻🇳",
+        "sender": "Nguyễn Văn A",
+        "body": "Chào buổi sáng! 🌞 This is a test with Vietnamese: Xin chào thế giới",
+        "timestamp": 1778592169,
+        "timestampISO": "2026-05-12T13:22:49.880Z",
+        "hasMedia": false,
+        "mediaFilename": null,
+        "seq": 0
+      }
+    }
+  ]
+}
