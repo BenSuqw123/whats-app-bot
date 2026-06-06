@@ -32,6 +32,140 @@ function getMessageId(message) {
   return `fallback_${Date.now()}_${Math.random()}`;
 }
 
+const albumBuffers = new Map();
+const seenAlbums = new Set();
+
+/*
+ * MIGRATION NOTE FOR BAILEYS ALBUM SUPPORT:
+ * whatsapp-web.js had a severe limitation where album parent was type=album, hasMedia=false, 
+ * childMessages=null and hidden "+N" media were not downloadable reliably.
+ * Therefore, the project has been refactored to use Baileys as the message ingestion layer.
+ * Because Baileys emits individual media messages separately, we group nearby media messages
+ * by chatId + senderJid + timestamp window to reconstruct albums reliably.
+ */
+
+function getAlbumId(message) {
+  if (message.type === 'album') {
+    return getMessageId(message);
+  }
+  const raw = message.rawData || message._data || {};
+  if (raw.type === 'album') {
+    return getMessageId(message);
+  }
+  if (raw.mediaGroupId) return String(raw.mediaGroupId);
+  if (raw.albumId) return String(raw.albumId);
+  if (raw.parentMsgId) return String(raw.parentMsgId);
+  if (Array.isArray(raw.childMessages) && raw.childMessages.length > 0) {
+    return getMessageId(message);
+  }
+  return null;
+}
+
+function findGroupId(message, fromStr) {
+  const explicitId = getAlbumId(message);
+  if (explicitId) {
+    return { groupId: explicitId, isExplicit: true };
+  }
+
+  // Otherwise, look for an active buffer in the same chat within 5 seconds for the same sender
+  const senderId = message.author || message.from || '';
+  const nowSec = message.timestamp || Math.floor(Date.now() / 1000);
+  for (const [groupId, group] of albumBuffers.entries()) {
+    if (group.fromStr === fromStr && group.senderId === senderId && !group.isExplicit) {
+      if (Math.abs(group.timestamp - nowSec) <= 5) {
+        return { groupId, isExplicit: false };
+      }
+    }
+  }
+
+  // Otherwise, generate a new window-based group ID
+  const newGroupId = `window_${fromStr}_${senderId}_${nowSec}_${Math.random().toString(36).substring(2, 7)}`;
+  return { groupId: newGroupId, isExplicit: false };
+}
+
+async function finalizeAlbumBatch(groupId, client) {
+  const group = albumBuffers.get(groupId);
+  if (!group) return;
+  albumBuffers.delete(groupId);
+  seenAlbums.add(groupId);
+
+  logger.info(`[messageHandler] album batch finalized: ${groupId}`);
+
+  try {
+    const uniqueMessagesMap = new Map();
+
+    for (const msg of group.messages) {
+      const msgId = getMessageId(msg);
+      if (msg.hasMedia) {
+        uniqueMessagesMap.set(msgId, msg);
+      }
+
+      const raw = msg.rawData || msg._data || {};
+      if (Array.isArray(raw.childMessages)) {
+        for (const childData of raw.childMessages) {
+          const { BaileysMessageWrapper } = require('../utils/baileysWrapper');
+          const childMsg = new BaileysMessageWrapper(childData, client);
+          const childId = getMessageId(childMsg);
+          if (childMsg.hasMedia) {
+            uniqueMessagesMap.set(childId, childMsg);
+          }
+        }
+      }
+    }
+
+    const uniqueMessages = Array.from(uniqueMessagesMap.values());
+    logger.info(`[messageHandler] Child count: ${uniqueMessages.length}`);
+
+    let metadata = group.metadata;
+    if (uniqueMessages.length === 1 && !group.isExplicit) {
+      const singleMsg = uniqueMessages[0];
+      const singleId = getMessageId(singleMsg);
+      metadata.id = singleId;
+      metadata.type = singleMsg.type || 'image';
+      metadata.body = singleMsg.body || metadata.body;
+      
+      seenIds.set(singleId, Date.now());
+      seenIds.set(groupId, Date.now());
+    } else {
+      for (const msgId of uniqueMessagesMap.keys()) {
+        seenIds.set(msgId, Date.now());
+      }
+      seenIds.set(groupId, Date.now());
+      
+      let body = '';
+      for (const msg of group.messages) {
+        if (msg.body) {
+          body = msg.body;
+          break;
+        }
+      }
+      metadata.body = body;
+    }
+
+    if (uniqueMessages.length === 0) {
+      logger.warn(`[messageHandler] Album batch ${groupId} finalized with 0 media items.`);
+      return;
+    }
+
+    if (uniqueMessages.length === 1 && !group.isExplicit) {
+      metadata = await mediaHandler.handle(uniqueMessages[0], metadata, metadata.id);
+    } else {
+      metadata = await mediaHandler.handleAlbum(uniqueMessages, metadata);
+    }
+
+    await jsonStorage.save(metadata);
+    health.metrics.incMessage();
+    
+    const preview = metadata.body
+      ? ` | "${metadata.body.slice(0, 60)}"`
+      : (metadata.mediaItems && metadata.mediaItems.length > 0 ? ` | [album:${metadata.mediaItems.length} items]` : (metadata.media ? ` | [${metadata.type}]` : ''));
+    logger.info(`[${metadata.chatType.toUpperCase()}] ${metadata.chatName} | ${metadata.sender}${preview}`);
+
+  } catch (err) {
+    logger.error(`[messageHandler] Error finalising album batch ${groupId}: ${err.message}`, { stack: err.stack });
+  }
+}
+
 async function handle(message, _client) {
   try {
     const msgId = getMessageId(message);
@@ -79,8 +213,6 @@ async function handle(message, _client) {
     const rawTs = message.timestamp;
     const tsMs  = rawTs && rawTs > 0 ? rawTs * 1000 : Date.now();
 
-    // chatId is only included when chatName is unavailable or chatType is unknown,
-    // because the folder structure already encodes chat identity for normal messages.
     const needsChatId = !chatName || chatName === 'Unknown' || chatType === 'unknown';
 
     let metadata = {
@@ -94,17 +226,49 @@ async function handle(message, _client) {
       body:      message.body || '',
     };
 
-    if (message.hasMedia) {
-      metadata = await mediaHandler.handle(message, metadata, msgId);
+    const isMedia = message.hasMedia;
+    const albumIdInfo = getAlbumId(message);
+    const isAlbumCandidate = isMedia || message.type === 'album' || albumIdInfo !== null;
+
+    if (isAlbumCandidate) {
+      const { groupId, isExplicit } = findGroupId(message, fromStr);
+      
+      logger.info(`[messageHandler] album candidate detected: ${groupId} (isExplicit: ${isExplicit})`);
+
+      if (seenAlbums.has(groupId)) {
+        logger.debug(`[messageHandler] Album group ${groupId} already processed — skipping individual message.`);
+        return;
+      }
+
+      let group = albumBuffers.get(groupId);
+      if (!group) {
+        const senderId = message.author || message.from || '';
+        group = {
+          groupId,
+          isExplicit,
+          fromStr,
+          senderId,
+          timestamp: message.timestamp || Math.floor(Date.now() / 1000),
+          messages: [],
+          metadata: { ...metadata, id: groupId, type: 'album' },
+          timer: null,
+        };
+        albumBuffers.set(groupId, group);
+
+        group.timer = setTimeout(() => {
+          finalizeAlbumBatch(groupId, _client).catch(err => {
+            logger.error(`[messageHandler] Error finalising album batch: ${err.message}`);
+          });
+        }, 1500);
+      }
+
+      group.messages.push(message);
+    } else {
+      await jsonStorage.save(metadata);
+      health.metrics.incMessage();
+      const preview = metadata.body ? ` | "${metadata.body.slice(0, 60)}"` : '';
+      logger.info(`[${chatType.toUpperCase()}] ${chatName} | ${sender}${preview}`);
     }
-
-    await jsonStorage.save(metadata);
-
-    health.metrics.incMessage();
-    const preview = metadata.body
-      ? ` | "${metadata.body.slice(0, 60)}"`
-      : (metadata.media ? ` | [${metadata.type}]` : '');
-    logger.info(`[${chatType.toUpperCase()}] ${chatName} | ${sender}${preview}`);
 
   } catch (err) {
     logger.error(`[messageHandler] Unhandled error: ${err.message}`, { stack: err.stack });

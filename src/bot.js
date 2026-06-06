@@ -1,23 +1,26 @@
 'use strict';
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const fs             = require('fs');
-const path           = require('path');
-const qrcode         = require('qrcode-terminal');
-const config         = require('./config');
-const logger         = require('./utils/logger');
-const storageService = require('./services/storageService');
-const messageHandler = require('./handlers/messageHandler');
-const health         = require('./utils/healthMonitor');
-const shutdown       = require('./utils/shutdownManager');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const pino             = require('pino');
+const path             = require('path');
+const fs               = require('fs');
+const qrcode           = require('qrcode-terminal');
+const config           = require('./config');
+const logger           = require('./utils/logger');
+const storageService   = require('./services/storageService');
+const messageHandler   = require('./handlers/messageHandler');
+const { BaileysMessageWrapper } = require('./utils/baileysWrapper');
+const health           = require('./utils/healthMonitor');
+const shutdown         = require('./utils/shutdownManager');
 
 let client = null;
 let isReconnecting = false;
 let reconnectCount = 0;
-let consecutiveAuthFailures = 0;
 
 const MAX_RETRIES   = config.reconnectMaxRetries;
 const BASE_DELAY_MS = config.reconnectDelayMs;
+
+const baileysLogger = pino({ level: 'silent' });
 
 function backoffDelay(attempt) {
   return Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 120_000);
@@ -46,16 +49,10 @@ async function scheduleReconnect(reason) {
 
   await new Promise((r) => setTimeout(r, delay));
 
-  if (client) {
-    try {
-      await client.destroy();
-    } catch (_) {}
-  }
-
   try {
-    await client.initialize();
+    await _buildClient();
   } catch (err) {
-    logger.error(`[bot] client.initialize() failed: ${err.message}`);
+    logger.error(`[bot] _buildClient() failed: ${err.message}`);
     isReconnecting = false;
     await scheduleReconnect('initialize() error');
   }
@@ -64,113 +61,77 @@ async function scheduleReconnect(reason) {
 }
 
 function start() {
-  if (client) {
-    logger.warn('[bot] start() called more than once — ignoring.');
-    return;
-  }
-
   storageService.ensureDirectories();
   health.start(config.healthIntervalMs);
 
   shutdown.registerCleanup('whatsapp-client', async () => {
     if (client) {
-      logger.info('[bot] Destroying WhatsApp client...');
-      try { await client.destroy(); } catch (_) {}
+      logger.info('[bot] Closing WhatsApp socket...');
+      try { client.end(); } catch (_) {}
     }
   });
 
-  _buildClient();
-}
-
-function _buildClient() {
-  client = new Client({
-    authStrategy: new LocalAuth({ dataPath: config.authPath }),
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-      ],
-    },
-    restartOnAuthFail: false,
-  });
-
-  client.on('qr', (qr) => {
-    logger.info('[bot] QR received — open WhatsApp → Linked Devices → Link a Device and scan:');
-    qrcode.generate(qr, { small: true });
-  });
-
-  client.on('authenticated', () => {
-    consecutiveAuthFailures = 0;
-    logger.info(`[bot] 🔐 Session authenticated (saved to "${config.authPath}").`);
-  });
-
-  client.on('ready', () => {
-    reconnectCount = 0;
-    isReconnecting = false;
-    consecutiveAuthFailures = 0;
-    logger.info('[bot] ✅ Bot is READY — listening for messages.');
-    logger.info(
-      `[bot] Collecting: Groups=${config.listenGroups} | DMs=${config.listenDMs} | Broadcasts=${config.listenBroadcasts}`
-    );
-    if (config.groupKeywords.length > 0) {
-      logger.info(`[bot] Group keyword filter: [${config.groupKeywords.join(', ')}]`);
-    } else {
-      logger.info('[bot] Group keyword filter: OFF (collecting from ALL groups)');
-    }
-  });
-
-  client.on('auth_failure', (msg) => {
-    consecutiveAuthFailures++;
-    health.metrics.incAuthFailure();
-    logger.error(`[bot] Auth failed (attempt ${consecutiveAuthFailures}): ${msg}`);
-    if (consecutiveAuthFailures >= 2) {
-      logger.error('[bot] Repeated auth failures — backing up corrupt session...');
-      _backupAndClearSession();
-    }
-  });
-
-  client.on('disconnected', (reason) => {
-    logger.warn(`[bot] Disconnected. Reason: ${reason}`);
-    health.metrics.incReconnect();
-    scheduleReconnect(reason).catch((err) => {
-      logger.error(`[bot] scheduleReconnect() threw: ${err.message}`);
-    });
-  });
-
-  client.on('message', async (msg) => {
-    await messageHandler.handle(msg, client);
-  });
-
-  client.on('message_create', async (msg) => {
-    await messageHandler.handle(msg, client);
-  });
-
-  logger.info('[bot] Initializing WhatsApp client (may take 15–30 s on first run)...');
-  client.initialize().catch((err) => {
-    logger.error(`[bot] Initial client.initialize() failed: ${err.message}`);
-    scheduleReconnect('startup failure').catch((e) => {
-      logger.error(`[bot] Could not schedule initial reconnect: ${e.message}`);
-    });
+  _buildClient().catch(err => {
+    logger.error(`[bot] Initial startup failed: ${err.message}`);
   });
 }
 
-function _backupAndClearSession() {
-  const authDir = path.resolve(config.authPath);
-  if (!fs.existsSync(authDir)) return;
-  const backup = `${authDir}_corrupt_${Date.now()}`;
-  try {
-    fs.renameSync(authDir, backup);
-    logger.warn(`[bot] Corrupt session backed up to: ${backup}`);
-    logger.warn('[bot] Next restart will show a fresh QR code.');
-  } catch (err) {
-    logger.error(`[bot] Could not back up session: ${err.message}`);
-  }
+async function _buildClient() {
+  const authDir = path.join(config.authPath, 'baileys_auth');
+  fs.mkdirSync(authDir, { recursive: true });
+  
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+  client = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    logger: baileysLogger,
+  });
+
+  client.ev.on('creds.update', saveCreds);
+
+  client.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    if (qr) {
+      logger.info('[bot] QR received — scan it using WhatsApp:');
+      qrcode.generate(qr, { small: true });
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      logger.warn(`[bot] Connection closed. Reason: ${lastDisconnect?.error?.message || statusCode}`);
+      health.metrics.incReconnect();
+      if (shouldReconnect) {
+        scheduleReconnect(lastDisconnect?.error?.message || 'connection closed').catch((err) => {
+          logger.error(`[bot] scheduleReconnect() failed: ${err.message}`);
+        });
+      } else {
+        logger.error(`[bot] Logged out from WhatsApp. Please clear session and run again.`);
+        process.exit(1);
+      }
+    } else if (connection === 'open') {
+      reconnectCount = 0;
+      isReconnecting = false;
+      logger.info('[bot] ✅ Bot is READY — listening for messages.');
+      logger.info(
+        `[bot] Collecting: Groups=${config.listenGroups} | DMs=${config.listenDMs} | Broadcasts=${config.listenBroadcasts}`
+      );
+      if (config.groupKeywords.length > 0) {
+        logger.info(`[bot] Group keyword filter: [${config.groupKeywords.join(', ')}]`);
+      } else {
+        logger.info('[bot] Group keyword filter: OFF (collecting from ALL groups)');
+      }
+    }
+  });
+
+  client.ev.on('messages.upsert', async (m) => {
+    if (m.type !== 'notify') return;
+    for (const msg of m.messages) {
+      const wrapped = new BaileysMessageWrapper(msg, client);
+      await messageHandler.handle(wrapped, client);
+    }
+  });
 }
 
 module.exports = { start };

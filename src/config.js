@@ -28,7 +28,7 @@ module.exports = Object.freeze({
 
   archiveBase: process.env.ARCHIVE_BASE || './archive',
 
-  authPath: process.env.AUTH_PATH || './.wwebjs_auth',
+  authPath: process.env.AUTH_PATH || './.baileys_auth',
 
   logLevel: process.env.LOG_LEVEL || 'info',
   logPath: process.env.LOG_PATH || './logs',

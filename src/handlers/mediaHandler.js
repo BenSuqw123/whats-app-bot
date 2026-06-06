@@ -79,29 +79,110 @@ function estimatedBytes(b64) {
   return Math.floor(((len - padded) * 3) / 4);
 }
 
+/*
+ * FALLBACK NOTE FOR ALBUM SUPPORT:
+ * If whatsapp-web.js (wwebjs) cannot expose album child messages reliably due to WhatsApp Web internal changes,
+ * it is recommended to transition to Baileys or Evolution API, which provide native/full protocol-level support 
+ * for multi-media/album messages and allow reliable collection of all children.
+ */
+
 async function handle(message, metadata, msgId) {
   await acquire();
   try {
-    return await _download(message, metadata, msgId);
+    metadata.mediaItems = [];
+    const item = await _downloadItem(message, metadata, msgId, 0);
+    if (item) {
+      metadata.mediaItems.push(item);
+      if (!item.skipped) {
+        metadata.media = {
+          filename: item.filename,
+          mimetype: item.mimetype,
+          size:     item.size,
+          path:     item.path,
+        };
+      } else {
+        metadata.media = {
+          mimetype: item.mimetype || undefined,
+          size:     item.size || 0,
+          skipped:  true,
+        };
+      }
+      logger.info(`[mediaHandler] Number of media items saved: 1`);
+    } else {
+      logger.info(`[mediaHandler] Number of media items saved: 0`);
+    }
+    return metadata;
   } finally {
     release();
   }
 }
 
-async function _download(message, metadata, msgId) {
+async function handleAlbum(messages, metadata) {
+  metadata.mediaItems = [];
+  
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    const childId = msg.id?._serialized || msg.id?.id || `fallback_${Date.now()}_${Math.random()}`;
+    await acquire();
+    try {
+      const item = await _downloadItem(msg, metadata, childId, i);
+      if (item) {
+        metadata.mediaItems.push(item);
+      }
+    } finally {
+      release();
+    }
+  }
+
+  // Populate metadata.media with the first item (backward compatibility)
+  if (metadata.mediaItems.length > 0) {
+    const firstItem = metadata.mediaItems[0];
+    if (!firstItem.skipped) {
+      metadata.media = {
+        filename: firstItem.filename,
+        mimetype: firstItem.mimetype,
+        size:     firstItem.size,
+        path:     firstItem.path,
+      };
+    } else {
+      metadata.media = {
+        mimetype: firstItem.mimetype || undefined,
+        size:     firstItem.size || 0,
+        skipped:  true,
+      };
+    }
+  }
+
+  logger.info(`[mediaHandler] Number of media items saved: ${metadata.mediaItems.length}`);
+  return metadata;
+}
+
+function timestampPrefixWithMs() {
+  const d   = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const padMs = (n) => String(n).padStart(3, '0');
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}_${padMs(d.getMilliseconds())}`;
+}
+
+function getShortHash(str) {
+  const crypto = require('crypto');
+  return crypto.createHash('md5').update(String(str)).digest('hex').slice(0, 6);
+}
+
+async function _downloadItem(message, metadata, msgId, index = 0) {
   let media;
   try {
     media = await message.downloadMedia();
   } catch (err) {
-    logger.warn(`[mediaHandler] downloadMedia() failed for ${msgId || '?'}: ${err.message}`);
+    logger.error(`[mediaHandler] Failed media item: ${msgId}`);
     health.metrics.incMediaFail();
-    return metadata;
+    return { messageId: msgId, index, skipped: true, error: err.message };
   }
 
   if (!media || !media.data) {
-    logger.warn(`[mediaHandler] Empty payload for ${msgId || '?'} — skipping.`);
+    logger.error(`[mediaHandler] Failed media item: ${msgId}`);
     health.metrics.incMediaFail();
-    return metadata;
+    return { messageId: msgId, index, skipped: true, error: 'Empty payload' };
   }
 
   const maxBytes    = config.maxMediaSizeMb * 1024 * 1024;
@@ -113,9 +194,7 @@ async function _download(message, metadata, msgId) {
       `> limit ${config.maxMediaSizeMb} MB (msg ${msgId || '?'})`
     );
     health.metrics.incMediaOversized();
-    // Record that media existed but was skipped, without storing null fields
-    metadata.media = { mimetype: media.mimetype || undefined, size: approxBytes, skipped: true };
-    return metadata;
+    return { mimetype: media.mimetype || undefined, size: approxBytes, skipped: true, messageId: msgId, index };
   }
 
   const mediaType = resolveMediaType(media.mimetype);
@@ -130,30 +209,33 @@ async function _download(message, metadata, msgId) {
   }
   ext = ext.replace(/[^a-zA-Z0-9]/g, '').toLowerCase() || 'bin';
 
-  const rawBase      = media.filename ? path.basename(media.filename, path.extname(media.filename)) : 'media';
-  const filename     = `${timestampPrefix()}_${safePart(metadata.chatName)}_${safePart(rawBase)}.${ext}`;
-  const uniqueSuffix = msgId ? String(msgId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8) : undefined;
+  const chatSafe = safePart(metadata.chatName);
+  const formattedIndex = String(index + 1).padStart(4, '0');
+  const msgHash = getShortHash(msgId);
+  const filename = `${timestampPrefixWithMs()}_${chatSafe}_album_${formattedIndex}_${msgHash}.${ext}`;
 
   try {
-    const { filePath, fileSize } = storageService.saveMedia(media.data, targetDir, filename, uniqueSuffix);
-    // Nested media object — only present when a file was actually persisted
-    metadata.media = {
-      filename: path.basename(filePath),
+    const { filePath, fileSize } = storageService.saveMedia(media.data, targetDir, filename);
+    health.metrics.incMediaOk();
+    const savedName = path.basename(filePath);
+    logger.info(`[mediaHandler] Single media saved: ${savedName}`);
+    return {
+      filename: savedName,
       mimetype: media.mimetype || undefined,
       size:     fileSize,
       path:     filePath,
+      messageId: msgId,
+      index
     };
-    health.metrics.incMediaOk();
   } catch (err) {
-    logger.error(`[mediaHandler] Failed to write media to disk: ${err.message}`);
+    logger.error(`[mediaHandler] Failed media item: ${msgId}`);
     health.metrics.incMediaFail();
+    return { messageId: msgId, index, skipped: true, error: err.message };
   }
-
-  return metadata;
 }
 
 function queueStats() {
   return { active: _active, queued: _queue.length };
 }
 
-module.exports = { handle, queueStats };
+module.exports = { handle, handleAlbum, queueStats };

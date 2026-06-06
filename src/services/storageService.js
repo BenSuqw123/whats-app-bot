@@ -47,12 +47,17 @@ function saveMedia(base64Data, directory, filename, uniqueSuffix) {
   const resolvedDir  = path.resolve(directory);
   const safeFilename = sanitizeFilename(filename);
 
-  const suffix    = uniqueSuffix || crypto.randomBytes(4).toString('hex');
+  fs.mkdirSync(resolvedDir, { recursive: true });
+
   const ext       = path.extname(safeFilename);
   const base      = path.basename(safeFilename, ext);
-  const finalName = `${base}_${suffix}${ext}`;
-
-  fs.mkdirSync(resolvedDir, { recursive: true });
+  
+  let finalName = safeFilename;
+  let counter = 1;
+  while (fs.existsSync(path.join(resolvedDir, finalName))) {
+    finalName = `${base}_${counter}${ext}`;
+    counter++;
+  }
 
   const buffer   = Buffer.from(base64Data, 'base64');
   const fullPath = path.join(resolvedDir, finalName);

@@ -5,3 +5,8 @@ downloads/
 data/
 logs/
 .env
+.baileys_auth/
+archive/
+test-downloads/
+test-output/
+debug_message_*.json
