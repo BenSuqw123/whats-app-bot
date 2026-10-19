@@ -1,137 +1,56 @@
 'use strict';
+const path = require('path');
+const fs = require('fs');
+const pino = require('pino');
+const { execFile } = require('child_process');
+const config = require('./config');
+const logger = require('./utils/logger');
+const storage = require('./services/storageService');
+const messages = require('./handlers/messageHandler');
+const media = require('./handlers/mediaHandler');
+const wrapper = require('./utils/baileysWrapper');
+const health = require('./utils/healthMonitor');
+const shutdown = require('./utils/shutdownManager');
+const { createLifecycle } = require('./utils/socketLifecycle');
+const { acquireSessionLock } = require('./utils/sessionLock');
+let controller, ownership, started = false;
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const pino             = require('pino');
-const path             = require('path');
-const fs               = require('fs');
-const qrcode           = require('qrcode-terminal');
-const config           = require('./config');
-const logger           = require('./utils/logger');
-const storageService   = require('./services/storageService');
-const messageHandler   = require('./handlers/messageHandler');
-const { BaileysMessageWrapper } = require('./utils/baileysWrapper');
-const health           = require('./utils/healthMonitor');
-const shutdown         = require('./utils/shutdownManager');
-
-let client = null;
-let isReconnecting = false;
-let reconnectCount = 0;
-
-const MAX_RETRIES   = config.reconnectMaxRetries;
-const BASE_DELAY_MS = config.reconnectDelayMs;
-
-const baileysLogger = pino({ level: 'silent' });
-
-function backoffDelay(attempt) {
-  return Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 120_000);
-}
-
-async function scheduleReconnect(reason) {
-  if (isReconnecting) {
-    logger.debug('[bot] Reconnect already in progress — skipping duplicate trigger.');
-    return;
-  }
-
-  isReconnecting = true;
-
-  if (reconnectCount >= MAX_RETRIES) {
-    logger.error(
-      `[bot] Max reconnect attempts (${MAX_RETRIES}) reached after "${reason}". Exiting.`
-    );
-    process.exit(1);
-  }
-
-  const delay = backoffDelay(reconnectCount);
-  reconnectCount++;
-  logger.warn(
-    `[bot] Reconnecting in ${delay}ms (attempt ${reconnectCount}/${MAX_RETRIES}). Reason: ${reason}`
-  );
-
-  await new Promise((r) => setTimeout(r, delay));
-
-  try {
-    await _buildClient();
-  } catch (err) {
-    logger.error(`[bot] _buildClient() failed: ${err.message}`);
-    isReconnecting = false;
-    await scheduleReconnect('initialize() error');
-  }
-
-  isReconnecting = false;
-}
-
-function start() {
-  storageService.ensureDirectories();
-  health.start(config.healthIntervalMs);
-
-  shutdown.registerCleanup('whatsapp-client', async () => {
-    if (client) {
-      logger.info('[bot] Closing WhatsApp socket...');
-      try { client.end(); } catch (_) {}
-    }
-  });
-
-  _buildClient().catch(err => {
-    logger.error(`[bot] Initial startup failed: ${err.message}`);
-  });
-}
-
-async function _buildClient() {
+async function start() {
+  if (started) return;
+  started = true;
   const authDir = path.join(config.authPath, 'baileys_auth');
-  fs.mkdirSync(authDir, { recursive: true });
-  
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-
-  client = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    logger: baileysLogger,
+  ownership = acquireSessionLock(authDir);
+  logger.info('[startup] ' + JSON.stringify({ pid: process.pid, cwd: process.cwd(), authPath: authDir }));
+  execFile('git', ['rev-parse', 'HEAD'], { windowsHide: true, timeout: 2000 }, (error, stdout) => {
+    if (!error) logger.info('[startup] revision=' + stdout.trim() + ' pid=' + process.pid);
   });
-
-  client.ev.on('creds.update', saveCreds);
-
-  client.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      logger.info('[bot] QR received — scan it using WhatsApp:');
-      qrcode.generate(qr, { small: true });
-    }
-
-    if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      logger.warn(`[bot] Connection closed. Reason: ${lastDisconnect?.error?.message || statusCode}`);
-      health.metrics.incReconnect();
-      if (shouldReconnect) {
-        scheduleReconnect(lastDisconnect?.error?.message || 'connection closed').catch((err) => {
-          logger.error(`[bot] scheduleReconnect() failed: ${err.message}`);
-        });
-      } else {
-        logger.error(`[bot] Logged out from WhatsApp. Please clear session and run again.`);
-        process.exit(1);
-      }
-    } else if (connection === 'open') {
-      reconnectCount = 0;
-      isReconnecting = false;
-      logger.info('[bot] ✅ Bot is READY — listening for messages.');
-      logger.info(
-        `[bot] Collecting: Groups=${config.listenGroups} | DMs=${config.listenDMs} | Broadcasts=${config.listenBroadcasts}`
-      );
-      if (config.groupKeywords.length > 0) {
-        logger.info(`[bot] Group keyword filter: [${config.groupKeywords.join(', ')}]`);
-      } else {
-        logger.info('[bot] Group keyword filter: OFF (collecting from ALL groups)');
-      }
-    }
+  storage.ensureDirectories();
+  controller = createLifecycle({
+    config,
+    async buildSocket() {
+      const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+      fs.mkdirSync(authDir, { recursive: true });
+      const { state, saveCreds } = await useMultiFileAuthState(authDir);
+      const socket = makeWASocket({ auth: state, logger: pino({ level: 'silent' }), printQRInTerminal: false });
+      return { socket, saveCreds };
+    },
+    onMessage: (msg, socket) => messages.handle(new wrapper.BaileysMessageWrapper(msg, socket), socket),
+    onFatal: () => shutdown.shutdown('socket-fatal', 1),
+    log: (level, event) => logger[level]('[bot] ' + JSON.stringify(event)),
+    onReconnect: health.metrics.incReconnect,
+    onAuth: kind => kind === 'CONFLICT' ? health.metrics.incConflict() : health.metrics.incAuthFailure(),
   });
-
-  client.ev.on('messages.upsert', async (m) => {
-    if (m.type !== 'notify') return;
-    for (const msg of m.messages) {
-      const wrapped = new BaileysMessageWrapper(msg, client);
-      await messageHandler.handle(wrapped, client);
-    }
+  health.registerProvider('socket', controller.stats);
+  health.registerProvider('messages', messages.stats);
+  health.registerProvider('media', media.queueStats);
+  health.registerProvider('groups', wrapper.cacheStats);
+  shutdown.registerStop(() => { controller.beginStop(); messages.beginStop(); media.beginStop(); });
+  shutdown.registerCleanup('collector', async () => {
+    // Release the session only after every writer/socket has stopped successfully.
+    await media.stop(); await messages.stop(); await controller.stop();
+    ownership.release();
   });
+  health.start(config.healthIntervalMs); // Referenced heartbeat keeps AUTH_REQUIRED observable and alive.
+  await controller.start();
 }
-
 module.exports = { start };

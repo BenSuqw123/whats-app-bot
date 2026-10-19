@@ -8,27 +8,9 @@ const health         = require('../utils/healthMonitor');
 
 const { resolveChatArchivePath } = storageService;
 
-let _active = 0;
-const _queue = [];
-
-function acquire() {
-  if (_active < config.mediaConcurrency) {
-    _active++;
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    _queue.push({ run: resolve });
-  });
-}
-
-function release() {
-  const next = _queue.shift();
-  if (next) {
-    next.run();
-  } else {
-    _active = Math.max(0, _active - 1);
-  }
-}
+const { createMediaQueue } = require('../utils/mediaQueue');
+const queue = createMediaQueue({ concurrency: config.mediaConcurrency,
+  maxQueued: config.maxMediaQueue, timeoutMs: config.mediaDownloadTimeoutMs });
 
 function resolveMediaType(mimetype) {
   if (!mimetype) return 'files';
@@ -73,88 +55,38 @@ function safePart(str, maxLen = 40) {
     .slice(0, maxLen) || 'unknown';
 }
 
-function estimatedBytes(b64) {
-  const len    = (b64 || '').length;
-  const padded = (b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0);
-  return Math.floor(((len - padded) * 3) / 4);
-}
-
-/*
- * FALLBACK NOTE FOR ALBUM SUPPORT:
- * If whatsapp-web.js (wwebjs) cannot expose album child messages reliably due to WhatsApp Web internal changes,
- * it is recommended to transition to Baileys or Evolution API, which provide native/full protocol-level support 
- * for multi-media/album messages and allow reliable collection of all children.
- */
-
-async function handle(message, metadata, msgId) {
-  await acquire();
-  try {
-    metadata.mediaItems = [];
-    const item = await _downloadItem(message, metadata, msgId, 0);
-    if (item) {
-      metadata.mediaItems.push(item);
-      if (!item.skipped) {
-        metadata.media = {
-          filename: item.filename,
-          mimetype: item.mimetype,
-          size:     item.size,
-          path:     item.path,
-        };
-      } else {
-        metadata.media = {
-          mimetype: item.mimetype || undefined,
-          size:     item.size || 0,
-          skipped:  true,
-        };
-      }
-      logger.info(`[mediaHandler] Number of media items saved: 1`);
-    } else {
-      logger.info(`[mediaHandler] Number of media items saved: 0`);
-    }
-    return metadata;
-  } finally {
-    release();
-  }
-}
-
-async function handleAlbum(messages, metadata) {
-  metadata.mediaItems = [];
-  
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    const childId = msg.id?._serialized || msg.id?.id || `fallback_${Date.now()}_${Math.random()}`;
-    await acquire();
-    try {
-      const item = await _downloadItem(msg, metadata, childId, i);
-      if (item) {
-        metadata.mediaItems.push(item);
-      }
-    } finally {
-      release();
-    }
-  }
-
-  // Populate metadata.media with the first item (backward compatibility)
-  if (metadata.mediaItems.length > 0) {
-    const firstItem = metadata.mediaItems[0];
-    if (!firstItem.skipped) {
-      metadata.media = {
-        filename: firstItem.filename,
-        mimetype: firstItem.mimetype,
-        size:     firstItem.size,
-        path:     firstItem.path,
-      };
-    } else {
-      metadata.media = {
-        mimetype: firstItem.mimetype || undefined,
-        size:     firstItem.size || 0,
-        skipped:  true,
-      };
-    }
-  }
-
-  logger.info(`[mediaHandler] Number of media items saved: ${metadata.mediaItems.length}`);
+function applyMedia(metadata) {
+  const item = metadata.mediaItems[0];
+  if (item) metadata.media = item.skipped
+    ? { mimetype: item.mimetype, size: item.size || 0, skipped: true }
+    : { filename: item.filename, mimetype: item.mimetype, size: item.size, path: item.path };
   return metadata;
+}
+async function runBatch(messages, metadata, ids) {
+  const completed = [];
+  try {
+    metadata.mediaItems = await queue.run(async signal => {
+      for (let i = 0; i < messages.length; i++) {
+        signal.throwIfAborted();
+        const item = await _downloadItem(messages[i], metadata, ids[i], i, signal);
+        signal.throwIfAborted();
+        completed.push(item);
+      }
+      signal.throwIfAborted();
+      return completed;
+    });
+  } catch (error) {
+    logger.warn('[mediaHandler] Media batch skipped: ' + error.code + ' pid=' + process.pid);
+    health.metrics.incMediaFail();
+    // Preserve earlier successes if a later item in an album hits the batch deadline.
+    metadata.mediaItems = ids.map((id, index) => completed[index] ||
+      ({ messageId: id, index, skipped: true, error: error.code || 'MEDIA_FAILED' }));
+  }
+  return applyMedia(metadata);
+}
+function handle(message, metadata, msgId) { return runBatch([message], metadata, [msgId]); }
+function handleAlbum(messages, metadata) {
+  return runBatch(messages, metadata, messages.map(msg => msg.id?._serialized || msg.id?.id || 'unknown'));
 }
 
 function timestampPrefixWithMs() {
@@ -169,73 +101,30 @@ function getShortHash(str) {
   return crypto.createHash('md5').update(String(str)).digest('hex').slice(0, 6);
 }
 
-async function _downloadItem(message, metadata, msgId, index = 0) {
+async function _downloadItem(message, metadata, msgId, index, signal) {
   let media;
   try {
-    media = await message.downloadMedia();
-  } catch (err) {
-    logger.error(`[mediaHandler] Failed media item: ${msgId}`);
-    health.metrics.incMediaFail();
-    return { messageId: msgId, index, skipped: true, error: err.message };
-  }
-
-  if (!media || !media.data) {
-    logger.error(`[mediaHandler] Failed media item: ${msgId}`);
-    health.metrics.incMediaFail();
-    return { messageId: msgId, index, skipped: true, error: 'Empty payload' };
-  }
-
-  const maxBytes    = config.maxMediaSizeMb * 1024 * 1024;
-  const approxBytes = estimatedBytes(media.data);
-
-  if (approxBytes > maxBytes) {
-    logger.warn(
-      `[mediaHandler] Skipping oversized media: ~${(approxBytes / 1024 / 1024).toFixed(1)} MB ` +
-      `> limit ${config.maxMediaSizeMb} MB (msg ${msgId || '?'})`
-    );
-    health.metrics.incMediaOversized();
-    return { mimetype: media.mimetype || undefined, size: approxBytes, skipped: true, messageId: msgId, index };
-  }
-
-  const mediaType = resolveMediaType(media.mimetype);
-  const targetDir = path.join(resolveChatArchivePath(metadata), mediaType);
-
-  let ext = 'bin';
-  if (media.filename) {
-    const rawExt = path.extname(media.filename).replace(/^\./, '');
-    ext = rawExt || mimeToExt(media.mimetype);
-  } else {
-    ext = mimeToExt(media.mimetype);
-  }
-  ext = ext.replace(/[^a-zA-Z0-9]/g, '').toLowerCase() || 'bin';
-
-  const chatSafe = safePart(metadata.chatName);
-  const formattedIndex = String(index + 1).padStart(4, '0');
-  const msgHash = getShortHash(msgId);
-  const filename = `${timestampPrefixWithMs()}_${chatSafe}_album_${formattedIndex}_${msgHash}.${ext}`;
-
-  try {
-    const { filePath, fileSize } = storageService.saveMedia(media.data, targetDir, filename);
+    const maxBytes = config.maxMediaSizeMb * 1024 * 1024;
+    signal.throwIfAborted();
+    media = await message.downloadMedia({ signal, maxBytes });
+    signal.throwIfAborted();
+    if (!media?.stream) throw new Error('Empty media stream');
+    const mediaType = resolveMediaType(media.mimetype);
+    const targetDir = path.join(resolveChatArchivePath(metadata), mediaType);
+    let ext = media.filename ? path.extname(media.filename).replace(/^\./, '') : mimeToExt(media.mimetype);
+    ext = (ext || mimeToExt(media.mimetype)).replace(/[^a-zA-Z0-9]/g, '').toLowerCase() || 'bin';
+    const filename = timestampPrefixWithMs() + '_' + safePart(metadata.chatName) + '_album_' +
+      String(index + 1).padStart(4, '0') + '_' + getShortHash(msgId) + '.' + ext;
+    const { filePath, fileSize } = await storageService.saveMediaStream(media.stream, targetDir, filename, { signal, maxBytes });
+    signal.throwIfAborted();
     health.metrics.incMediaOk();
-    const savedName = path.basename(filePath);
-    logger.info(`[mediaHandler] Single media saved: ${savedName}`);
-    return {
-      filename: savedName,
-      mimetype: media.mimetype || undefined,
-      size:     fileSize,
-      path:     filePath,
-      messageId: msgId,
-      index
-    };
-  } catch (err) {
-    logger.error(`[mediaHandler] Failed media item: ${msgId}`);
-    health.metrics.incMediaFail();
-    return { messageId: msgId, index, skipped: true, error: err.message };
-  }
+    logger.info('[mediaHandler] Media saved bytes=' + fileSize + ' pid=' + process.pid);
+    return { filename: path.basename(filePath), mimetype: media.mimetype, size: fileSize, path: filePath, messageId: msgId, index };
+  } catch (error) {
+    if (error.code === 'MEDIA_OVERSIZED') health.metrics.incMediaOversized();
+    else health.metrics.incMediaFail();
+    logger.warn('[mediaHandler] Download/save failed pid=' + process.pid + ' code=' + (error.code || 'MEDIA_FAILED'));
+    return { messageId: msgId, index, skipped: true, error: error.code || 'MEDIA_FAILED' };
+  } finally { media?.stream?.destroy(); }
 }
-
-function queueStats() {
-  return { active: _active, queued: _queue.length };
-}
-
-module.exports = { handle, handleAlbum, queueStats };
+module.exports = { handle, handleAlbum, queueStats: queue.stats, beginStop: queue.beginStop, stop: queue.stop };

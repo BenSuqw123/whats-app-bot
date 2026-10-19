@@ -1,10 +1,11 @@
 'use strict';
 
-const pino = require('pino');
+const config = require('../config');
+const { BoundedCache } = require('./boundedCache');
+const { openMediaStream } = require('./mediaStream');
 const logger = require('./logger');
 
-const baileysLogger = pino({ level: 'silent' });
-const groupMetadataCache = new Map();
+const groupMetadataCache = new BoundedCache(config.maxGroupCache, config.groupCacheTtlMs);
 
 async function getGroupMetadata(sock, groupId) {
   if (groupMetadataCache.has(groupId)) {
@@ -116,7 +117,7 @@ class BaileysMessageWrapper {
     };
   }
 
-  async downloadMedia() {
+  async downloadMedia({ signal, maxBytes } = {}) {
     const content = getMessageContent(this.rawMsg.message);
     if (!content) return null;
     
@@ -130,23 +131,24 @@ class BaileysMessageWrapper {
     if (!mediaKey) return null;
     const mediaInfo = content[mediaKey];
     
-    const { downloadMediaMessage } = require('@whiskeysockets/baileys');
-    const buffer = await downloadMediaMessage(
-      this.rawMsg,
-      'buffer',
-      {},
-      { logger: baileysLogger }
-    );
-
-    if (!buffer) return null;
-
+    if (!signal) throw new Error('Media download requires a cancellation signal');
+    signal.throwIfAborted();
+    const declaredSize = Number(mediaInfo.fileLength || 0);
+    if (declaredSize > maxBytes) throw Object.assign(new Error('Media metadata exceeds size limit'), { code: 'MEDIA_OVERSIZED' });
+    const stream = await openMediaStream(mediaInfo, mediaKey.replace('Message', ''), { signal, maxBytes });
+    if (signal.aborted) { stream.destroy(); signal.throwIfAborted(); }
+    const abort = () => stream.destroy(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    // Keep the abort listener through pipeline consumption; cleanup when destroyed/closed.
+    stream.once('close', () => signal.removeEventListener('abort', abort));
+    stream.on('error', () => {}); // pipeline observes failures; also safe if aborted before attaching it.
     return {
       mimetype: mediaInfo.mimetype,
-      data: buffer.toString('base64'),
+      stream,
       filename: mediaInfo.fileName || mediaInfo.filename || null,
-      filesize: mediaInfo.fileLength ? Number(mediaInfo.fileLength) : buffer.length,
+      filesize: declaredSize,
     };
   }
 }
 
-module.exports = { BaileysMessageWrapper, getMessageContent };
+module.exports = { BaileysMessageWrapper, getMessageContent, cacheStats: () => ({ groupCacheSize: groupMetadataCache.size }) };

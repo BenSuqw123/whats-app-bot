@@ -119,9 +119,12 @@ async function save(metadata) {
 
     logger.debug(`[jsonStorage] → ${filePath}`);
     health.metrics.incJsonOk();
+    health.markPersisted();
+    return true;
   } catch (err) {
     logger.error(`[jsonStorage] Failed to save record: ${err.message}`);
     health.metrics.incJsonFail();
+    return false;
   }
 }
 
@@ -198,7 +201,6 @@ function runMigration() {
   }
 }
 
-// Automatically trigger migration on startup
-runMigration();
+// Migration is explicit only; importing the collector must never rewrite historical archive.
 
 module.exports = { save, readNdjson, runMigration };

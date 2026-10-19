@@ -10,3 +10,5 @@ archive/
 test-downloads/
 test-output/
 debug_message_*.json
+deploy-logs/
+.deploy.lock/

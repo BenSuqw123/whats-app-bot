@@ -3,6 +3,10 @@
 const logger = require('./logger');
 
 let _timer = null;
+let lastMessagePersistedAt = null;
+const providers = new Map();
+function registerProvider(name, fn) { providers.set(name, fn); }
+function markPersisted() { lastMessagePersistedAt = Date.now(); }
 
 const START_TIME = Date.now();
 
@@ -16,6 +20,7 @@ const _counters = {
   jsonFailed:            0,
   reconnects:            0,
   authFailures:          0,
+  conflictEvents:        0,
   dedupHits:             0,
 };
 
@@ -31,6 +36,7 @@ const metrics = {
   incJsonFail:       inc('jsonFailed'),
   incReconnect:      inc('reconnects'),
   incAuthFailure:    inc('authFailures'),
+  incConflict:       inc('conflictEvents'),
   incDedup:          inc('dedupHits'),
 };
 
@@ -57,6 +63,12 @@ function getStats() {
     heapUsedMB:  (mem.heapUsed  / 1024 / 1024).toFixed(1),
     heapTotalMB: (mem.heapTotal / 1024 / 1024).toFixed(1),
     rssMB:       (mem.rss       / 1024 / 1024).toFixed(1),
+    pid: process.pid,
+    process: "alive",
+    externalMB: (mem.external / 1024 / 1024).toFixed(1),
+    arrayBuffersMB: (mem.arrayBuffers / 1024 / 1024).toFixed(1),
+    lastMessagePersistedAt,
+    ...Object.assign({}, ...Array.from(providers.values(), fn => fn())),
     ..._counters,
   };
 }
@@ -65,14 +77,7 @@ async function printHealthSummary() {
   const lag   = await measureEventLoopLag();
   const stats = getStats();
 
-  logger.info(
-    `[health] uptime=${stats.uptime} | heap=${stats.heapUsedMB}/${stats.heapTotalMB}MB ` +
-    `rss=${stats.rssMB}MB | evLoop=${lag}ms | ` +
-    `msgs=${stats.messagesProcessed} skip=${stats.messagesSkipped} dedup=${stats.dedupHits} | ` +
-    `media=ok:${stats.mediaDownloaded} fail:${stats.mediaFailed} big:${stats.mediaSkippedOversized} | ` +
-    `json=ok:${stats.jsonWritten} fail:${stats.jsonFailed} | ` +
-    `reconnects=${stats.reconnects} authFail=${stats.authFailures}`
-  );
+  logger.info("[health] " + JSON.stringify({ ...stats, eventLoopLagMs: lag }));
 
   if (lag > 200) {
     logger.warn(`[health] ⚠ Event loop lag is HIGH: ${lag}ms — check for blocking synchronous I/O`);
@@ -88,7 +93,7 @@ function start(intervalMs = 300_000) {
     try { await printHealthSummary(); } catch (_) {}
   }, intervalMs);
 
-  if (_timer.unref) _timer.unref();
+  // Keep AUTH_REQUIRED and prolonged network recovery alive and observable.
 
   logger.debug(`[health] Health monitor started (interval=${intervalMs}ms)`);
 }
@@ -101,4 +106,4 @@ function stop() {
   }
 }
 
-module.exports = { start, stop, getStats, printHealthSummary, metrics };
+module.exports = { start, stop, getStats, printHealthSummary, metrics, registerProvider, markPersisted };

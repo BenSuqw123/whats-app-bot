@@ -7,21 +7,14 @@ const jidUtils    = require('../utils/jidUtils');
 const mediaHandler = require('./mediaHandler');
 const jsonStorage  = require('../services/jsonStorageService');
 const health       = require('../utils/healthMonitor');
+const { BoundedCache } = require('../utils/boundedCache');
+let stopping = false;
+const pendingBatches = new Set();
 
-const DEDUP_TTL_MS = 10_000;
-const DEDUP_MAX    = 2_000;
-const seenIds      = new Map();
-
+const seenIds = new BoundedCache(2000, 10000);
 function isDuplicate(msgId) {
-  const now = Date.now();
-  if (seenIds.size >= DEDUP_MAX) {
-    for (const [id, ts] of seenIds) {
-      if (now - ts > DEDUP_TTL_MS) seenIds.delete(id);
-    }
-  }
   if (seenIds.has(msgId)) { health.metrics.incDedup(); return true; }
-  seenIds.set(msgId, now);
-  return false;
+  seenIds.set(msgId, true); return false;
 }
 
 function getMessageId(message) {
@@ -33,11 +26,11 @@ function getMessageId(message) {
 }
 
 const albumBuffers = new Map();
-const seenAlbums = new Set();
+const seenAlbums = new BoundedCache(config.maxSeenAlbums, config.seenAlbumTtlMs);
 
 /*
  * MIGRATION NOTE FOR BAILEYS ALBUM SUPPORT:
- * whatsapp-web.js had a severe limitation where album parent was type=album, hasMedia=false, 
+ * whatsapp-web.js had a severe limitation where album parent was type=album, hasMedia=false,
  * childMessages=null and hidden "+N" media were not downloadable reliably.
  * Therefore, the project has been refactored to use Baileys as the message ingestion layer.
  * Because Baileys emits individual media messages separately, we group nearby media messages
@@ -89,26 +82,25 @@ async function finalizeAlbumBatch(groupId, client) {
   albumBuffers.delete(groupId);
   seenAlbums.add(groupId);
 
-  logger.info(`[messageHandler] album batch finalized: ${groupId}`);
 
   try {
     const uniqueMessagesMap = new Map();
+    const addMedia = msg => {
+      if (!msg.hasMedia) return;
+      const id = getMessageId(msg);
+      if (uniqueMessagesMap.has(id) || uniqueMessagesMap.size < config.maxAlbumItems) uniqueMessagesMap.set(id, msg);
+      else { health.metrics.incSkipped(); logger.warn('[messageHandler] Expanded album item limit reached; child skipped'); }
+    };
 
     for (const msg of group.messages) {
-      const msgId = getMessageId(msg);
-      if (msg.hasMedia) {
-        uniqueMessagesMap.set(msgId, msg);
-      }
+      addMedia(msg);
 
       const raw = msg.rawData || msg._data || {};
       if (Array.isArray(raw.childMessages)) {
         for (const childData of raw.childMessages) {
           const { BaileysMessageWrapper } = require('../utils/baileysWrapper');
           const childMsg = new BaileysMessageWrapper(childData, client);
-          const childId = getMessageId(childMsg);
-          if (childMsg.hasMedia) {
-            uniqueMessagesMap.set(childId, childMsg);
-          }
+          addMedia(childMsg);
         }
       }
     }
@@ -123,7 +115,7 @@ async function finalizeAlbumBatch(groupId, client) {
       metadata.id = singleId;
       metadata.type = singleMsg.type || 'image';
       metadata.body = singleMsg.body || metadata.body;
-      
+
       seenIds.set(singleId, Date.now());
       seenIds.set(groupId, Date.now());
     } else {
@@ -131,7 +123,7 @@ async function finalizeAlbumBatch(groupId, client) {
         seenIds.set(msgId, Date.now());
       }
       seenIds.set(groupId, Date.now());
-      
+
       let body = '';
       for (const msg of group.messages) {
         if (msg.body) {
@@ -153,13 +145,10 @@ async function finalizeAlbumBatch(groupId, client) {
       metadata = await mediaHandler.handleAlbum(uniqueMessages, metadata);
     }
 
-    await jsonStorage.save(metadata);
-    health.metrics.incMessage();
-    
-    const preview = metadata.body
-      ? ` | "${metadata.body.slice(0, 60)}"`
-      : (metadata.mediaItems && metadata.mediaItems.length > 0 ? ` | [album:${metadata.mediaItems.length} items]` : (metadata.media ? ` | [${metadata.type}]` : ''));
-    logger.info(`[${metadata.chatType.toUpperCase()}] ${metadata.chatName} | ${metadata.sender}${preview}`);
+    if (stopping) return;
+    if (await jsonStorage.save(metadata)) health.metrics.incMessage();
+
+    logger.info("[messageHandler] Album record processed");
 
   } catch (err) {
     logger.error(`[messageHandler] Error finalising album batch ${groupId}: ${err.message}`, { stack: err.stack });
@@ -167,6 +156,7 @@ async function finalizeAlbumBatch(groupId, client) {
 }
 
 async function handle(message, _client) {
+  if (stopping) return;
   try {
     const msgId = getMessageId(message);
     if (isDuplicate(msgId)) {
@@ -226,14 +216,14 @@ async function handle(message, _client) {
       body:      message.body || '',
     };
 
+    if (stopping) return;
     const isMedia = message.hasMedia;
     const albumIdInfo = getAlbumId(message);
     const isAlbumCandidate = isMedia || message.type === 'album' || albumIdInfo !== null;
 
     if (isAlbumCandidate) {
       const { groupId, isExplicit } = findGroupId(message, fromStr);
-      
-      logger.info(`[messageHandler] album candidate detected: ${groupId} (isExplicit: ${isExplicit})`);
+
 
       if (seenAlbums.has(groupId)) {
         logger.debug(`[messageHandler] Album group ${groupId} already processed — skipping individual message.`);
@@ -242,6 +232,11 @@ async function handle(message, _client) {
 
       let group = albumBuffers.get(groupId);
       if (!group) {
+        if (albumBuffers.size >= config.maxAlbumBuffers) {
+          health.metrics.incSkipped();
+          logger.warn("[messageHandler] Album buffer full; media message skipped");
+          return;
+        }
         const senderId = message.author || message.from || '';
         group = {
           groupId,
@@ -256,18 +251,23 @@ async function handle(message, _client) {
         albumBuffers.set(groupId, group);
 
         group.timer = setTimeout(() => {
-          finalizeAlbumBatch(groupId, _client).catch(err => {
+          const task = finalizeAlbumBatch(groupId, _client).catch(err => {
             logger.error(`[messageHandler] Error finalising album batch: ${err.message}`);
           });
+          pendingBatches.add(task);
+          task.finally(() => pendingBatches.delete(task)).catch(() => {});
         }, 1500);
       }
 
+      if (group.messages.length >= config.maxAlbumItems) {
+        health.metrics.incSkipped();
+        logger.warn("[messageHandler] Album item limit reached; media message skipped");
+        return;
+      }
       group.messages.push(message);
     } else {
-      await jsonStorage.save(metadata);
-      health.metrics.incMessage();
-      const preview = metadata.body ? ` | "${metadata.body.slice(0, 60)}"` : '';
-      logger.info(`[${chatType.toUpperCase()}] ${chatName} | ${sender}${preview}`);
+      if (await jsonStorage.save(metadata)) health.metrics.incMessage();
+      logger.info("[messageHandler] Text record processed");
     }
 
   } catch (err) {
@@ -275,4 +275,11 @@ async function handle(message, _client) {
   }
 }
 
-module.exports = { handle };
+function beginStop() {
+  stopping = true;
+  for (const group of albumBuffers.values()) clearTimeout(group.timer);
+  albumBuffers.clear();
+}
+async function stop() { beginStop(); await Promise.allSettled([...pendingBatches]); }
+module.exports = { handle, beginStop, stop, stats: () => ({ seenAlbumsSize: seenAlbums.size,
+  seenIdsSize: seenIds.size, albumBuffers: albumBuffers.size, pendingBatches: pendingBatches.size }) };
